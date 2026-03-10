@@ -1,0 +1,298 @@
+library(ggplot2)
+library(RColorBrewer)
+library(data.table)
+
+# Define consistent color scheme for protocols
+protocol_colors <- c(
+  "b'tcp'" = "#3498db",    # Blue for TCP
+  "b'udp'" = "#2ecc71",    # Green for UDP
+  "b'icmp'" = "#f39c12",   # Orange for ICMP
+  "b'unknown'" = "#7f8c8d", # Gray for unknown
+  # Also include other variants for compatibility
+  "TCP" = "#3498db",
+  "UDP" = "#2ecc71", 
+  "ICMP" = "#f39c12",
+  "unknown" = "#7f8c8d",
+  "tcp" = "#3498db",
+  "udp" = "#2ecc71", 
+  "icmp" = "#f39c12"
+)
+
+# Function to create attack type distribution by protocol
+create_attack_by_protocol_plot <- function(data) {
+  # Debug: Check what protocols we have
+  cat("Unique protocols in data:", paste(unique(data$protocol_type), collapse = ", "), "\n")
+  
+  # Create a data frame of attack types by protocol
+  attack_by_protocol <- data.frame()
+  
+  for (protocol in unique(data$protocol_type)) {
+    # Skip if protocol is NA or empty
+    if (is.na(protocol) || protocol == "") {
+      cat("Skipping protocol:", protocol, "\n")
+      next
+    }
+    
+    # Get protocol data
+    protocol_subset <- data[data$protocol_type == protocol, ]
+    
+    # Skip if empty
+    if (nrow(protocol_subset) == 0) {
+      cat("No data for protocol:", protocol, "\n")
+      next
+    }
+    
+    cat("Processing protocol:", protocol, "with", nrow(protocol_subset), "rows\n")
+    
+    # Count attack types
+    attack_counts <- table(protocol_subset$class)
+    
+    # Filter out empty or NA attack names
+    attack_counts <- attack_counts[names(attack_counts) != "" & !is.na(names(attack_counts))]
+    
+    if (length(attack_counts) == 0) {
+      cat("No valid attack types for protocol:", protocol, "\n")
+      next
+    }
+    
+    # Calculate percentages
+    attack_percentages <- 100 * attack_counts / sum(attack_counts)
+    
+    # Add to data frame
+    for (attack in names(attack_counts)) {
+      if (attack != "" && !is.na(attack)) {
+        count_val <- as.numeric(attack_counts[attack])
+        percentage_val <- as.numeric(attack_percentages[attack])
+        
+        # Skip if values are NA
+        if (is.na(count_val) || is.na(percentage_val)) next
+        
+        attack_by_protocol <- rbind(
+          attack_by_protocol,
+          data.frame(
+            Protocol = as.character(protocol),  # Ensure character type
+            AttackType = as.character(attack),
+            Count = count_val,
+            Percentage = percentage_val,
+            stringsAsFactors = FALSE
+          )
+        )
+      }
+    }
+  }
+  
+  # Debug: Check final data frame
+  cat("Final attack_by_protocol data frame has", nrow(attack_by_protocol), "rows\n")
+  cat("Protocols in final data:", paste(unique(attack_by_protocol$Protocol), collapse = ", "), "\n")
+  
+  # Create a stacked bar chart showing percentages
+  p <- ggplot(attack_by_protocol, aes(x = Protocol, y = Percentage, fill = Protocol)) +
+    geom_bar(stat = "identity", alpha = 0.8) +
+    theme_minimal() +
+    labs(
+      title = "Attack Type Distribution by Protocol",
+      x = "Protocol",
+      y = "Percentage",
+      fill = "Protocol"
+    ) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    scale_fill_manual(values = protocol_colors, na.value = "grey50")  # Add na.value
+  
+  return(p)
+}
+
+# Function to create feature importance by protocol
+create_feature_importance_by_protocol <- function(data, ranger_fn) {
+  # Create a list to store importance data frames
+  importance_by_protocol <- list()
+  
+  # Get feature importance for each protocol
+  for (protocol in unique(data$protocol_type)) {
+    # Skip if protocol is NA or empty
+    if (is.na(protocol) || protocol == "") next
+    
+    # Get protocol data
+    protocol_subset <- data[data$protocol_type == protocol, ]
+    
+    # Skip if too few samples
+    if (nrow(protocol_subset) < 100) {
+      cat("Skipping protocol", protocol, "due to insufficient samples (", nrow(protocol_subset), ")\n")
+      next
+    }
+    
+    cat("Processing feature importance for protocol:", protocol, "\n")
+    
+    # Add random feature for baseline
+    set.seed(123)
+    protocol_subset$random <- runif(nrow(protocol_subset), 1, 100)
+    
+    # Train a quick random forest for feature importance
+    tryCatch({
+      protocol_model <- ranger_fn(
+        formula = class ~ .,
+        data = protocol_subset,
+        importance = "impurity",
+        num.trees = 50,
+        verbose = FALSE
+      )
+      
+      # Get importance
+      imp <- importance(protocol_model)
+      
+      # Create data frame
+      imp_df <- data.frame(
+        Feature = names(imp),
+        Importance = as.numeric(imp),
+        Protocol = as.character(protocol),  # Ensure character type
+        stringsAsFactors = FALSE
+      )
+      
+      # Sort by importance
+      imp_df <- imp_df[order(-imp_df$Importance), ]
+      
+      # Keep top 10 features
+      imp_df <- imp_df[1:min(10, nrow(imp_df)), ]
+      
+      # Store in list
+      importance_by_protocol[[as.character(protocol)]] <- imp_df
+    }, error = function(e) {
+      cat("Error in protocol", protocol, ":", e$message, "\n")
+    })
+  }
+  
+  # Combine all importance data frames
+  if (length(importance_by_protocol) == 0) {
+    cat("No importance data generated\n")
+    return(NULL)
+  }
+  
+  all_importance <- do.call(rbind, importance_by_protocol)
+  
+  # Create plot
+  p <- ggplot(all_importance, aes(x = reorder(Feature, Importance), y = Importance, fill = Protocol)) +
+    geom_bar(stat = "identity", alpha = 0.8) +
+    facet_wrap(~ Protocol, scales = "free_y") +
+    coord_flip() +
+    theme_minimal() +
+    labs(
+      title = "Top Features by Protocol",
+      x = "Feature",
+      y = "Importance",
+      fill = "Protocol"
+    ) +
+    theme(legend.position = "none") +
+    scale_fill_manual(values = protocol_colors, na.value = "grey50")
+  
+  return(p)
+}
+
+# Function to create service distribution by protocol
+create_service_by_protocol <- function(data) {
+  # Create a data frame of services by protocol
+  service_by_protocol <- data.frame()
+  
+  for (protocol in unique(data$protocol_type)) {
+    # Skip if protocol is NA or empty
+    if (is.na(protocol) || protocol == "") next
+    
+    # Get protocol data
+    protocol_subset <- data[data$protocol_type == protocol, ]
+    
+    # Skip if empty
+    if (nrow(protocol_subset) == 0) next
+    
+    # Skip if no service column
+    if (!"service" %in% colnames(protocol_subset)) {
+      cat("No service column found for protocol:", protocol, "\n")
+      next
+    }
+    
+    # Count services (top 10)
+    service_counts <- sort(table(protocol_subset$service), decreasing = TRUE)
+    
+    # Filter out empty or NA service names
+    service_counts <- service_counts[names(service_counts) != "" & !is.na(names(service_counts))]
+    
+    if (length(service_counts) == 0) {
+      cat("No valid services for protocol:", protocol, "\n")
+      next
+    }
+    
+    service_counts <- service_counts[1:min(10, length(service_counts))]
+    
+    # Calculate percentages
+    service_percentages <- 100 * service_counts / sum(service_counts)
+    
+    # Add to data frame
+    for (service in names(service_counts)) {
+      # Skip empty or NA services
+      if (is.na(service) || service == "") next
+      
+      count_val <- as.numeric(service_counts[service])
+      percentage_val <- as.numeric(service_percentages[service])
+      
+      # Skip if counts are NA or null
+      if (is.na(count_val) || is.na(percentage_val)) next
+      
+      service_by_protocol <- rbind(
+        service_by_protocol,
+        data.frame(
+          Protocol = as.character(protocol),
+          Service = as.character(service),
+          Count = count_val,
+          Percentage = percentage_val,
+          stringsAsFactors = FALSE
+        )
+      )
+    }
+  }
+  
+  # Check if we have data
+  if (nrow(service_by_protocol) == 0) {
+    cat("No service data found\n")
+    return(NULL)
+  }
+  
+  # Create a grouped bar chart
+  p <- ggplot(service_by_protocol, aes(x = reorder(Service, -Percentage), y = Percentage, fill = Protocol)) +
+    geom_bar(stat = "identity", position = "dodge", alpha = 0.8) +
+    theme_minimal() +
+    labs(
+      title = "Top Services by Protocol",
+      x = "Service",
+      y = "Percentage",
+      fill = "Protocol"
+    ) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    scale_fill_manual(values = protocol_colors, na.value = "grey50")
+  
+  return(p)
+}
+
+# Diagnostic function to check your data
+diagnose_protocol_data <- function(data) {
+  cat("=== PROTOCOL DATA DIAGNOSIS ===\n")
+  cat("Dataset dimensions:", nrow(data), "rows,", ncol(data), "columns\n")
+  cat("Protocol column exists:", "protocol_type" %in% colnames(data), "\n")
+  
+  if ("protocol_type" %in% colnames(data)) {
+    cat("Unique protocols:\n")
+    protocol_table <- table(data$protocol_type, useNA = "ifany")
+    print(protocol_table)
+    
+    cat("\nProtocol data types:\n")
+    print(sapply(unique(data$protocol_type), class))
+  }
+  
+  cat("\nClass column exists:", "class" %in% colnames(data), "\n")
+  if ("class" %in% colnames(data)) {
+    cat("Unique classes (first 10):\n")
+    print(head(table(data$class), 10))
+  }
+  
+  cat("\nService column exists:", "service" %in% colnames(data), "\n")
+  if ("service" %in% colnames(data)) {
+    cat("Unique services (first 10):\n")
+    print(head(table(data$service), 10))
+  }
+}
